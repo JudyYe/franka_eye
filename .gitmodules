@@ -1,0 +1,6 @@
+[submodule "FoundationPose"]
+	path = FoundationPose
+	url = git@github.com:JudyYe/FoundationPose.git
+[submodule "Grounded-SAM-2"]
+	path = Grounded-SAM-2
+	url = https://github.com/IDEA-Research/Grounded-SAM-2.git
