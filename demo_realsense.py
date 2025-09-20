@@ -1,7 +1,7 @@
 # use grounded sam 2 to find the mask, instead of user selection
 # monitor pose score, if it's below a threshold, re initialize pose
 
-
+import imageio
 import os
 import os.path as osp
 import pickle
@@ -12,6 +12,7 @@ import trimesh
 import logging
 import torch
 import nvdiffrast.torch as dr
+from FoundationPose.Utils import nvdiffrast_render
 from FoundationPose.estimater import FoundationPose
 from FoundationPose.learning.training.predict_score import ScorePredictor
 from FoundationPose.learning.training.predict_pose_refine import PoseRefinePredictor
@@ -112,7 +113,8 @@ class Text2MaskPredictor:
         
         # Convert boxes to SAM2 format
         h, w, _ = image_source.shape
-        boxes = boxes * torch.Tensor([w, h, w, h])
+        print('boxes.device', boxes.device, 'self.device', self.device, confidences.device,  image_tensor.device)
+        boxes = boxes * torch.Tensor([w, h, w, h]).to(boxes.device)
         input_boxes = self.box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
         
         # Enable autocast for better performance
@@ -220,172 +222,10 @@ def get_camera_intrinsics(intr):
     ])
     return K
 
-class InteractiveMaskSelector:
-    """Interactive mask selection using mouse clicks and SAM2."""
-    
-    def __init__(self, device='cuda:0'):
-        self.device = device
-        self.sam2_predictor = None
-        self.current_image = None
-        self.current_mask = None
-        self.click_points = []
-        self.click_labels = []  # 1 for positive, 0 for negative
-        self.window_name = "Interactive Mask Selection"
-        
-    def setup_sam2(self):
-        """Initialize SAM2 image predictor."""
-        sam2_model = build_sam2_hf('facebook/sam2-hiera-large', device=self.device)
 
-        predictor = SAM2ImagePredictor(sam2_model)        
-        self.sam2_predictor = predictor
-        return True
-    
-    def mouse_callback(self, event, x, y, flags, param):
-        """Handle mouse clicks for mask selection."""
-        if event == cv2.EVENT_LBUTTONDOWN:
-            # Left click - positive point
-            self.click_points.append([x, y])
-            self.click_labels.append(1)
-            logging.info(f"Added positive point at ({x}, {y})")
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            # Right click - negative point
-            self.click_points.append([x, y])
-            self.click_labels.append(0)
-            logging.info(f"Added negative point at ({x}, {y})")
-        elif event == cv2.EVENT_MBUTTONDOWN:
-            # Middle click - clear all points
-            self.click_points = []
-            self.click_labels = []
-            logging.info("Cleared all points")
-    
-    def generate_mask_from_clicks(self, image):
-        """Generate mask using SAM2 based on user clicks."""
-        if not self.sam2_predictor or len(self.click_points) == 0:
-            return None
-        
-        try:
-            # Convert image to RGB if needed
-            if len(image.shape) == 3 and image.shape[2] == 3:
-                rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            else:
-                rgb_image = image
-            
-            # Prepare points and labels for SAM2
-            points = np.array(self.click_points)
-            labels = np.array(self.click_labels)
-            
-            # Use SAM2 image predictor to generate mask
-            # Set the image first
-            self.sam2_predictor.set_image(rgb_image)
-            
-            # Predict mask from points
-            masks, scores, logits = self.sam2_predictor.predict(
-                point_coords=points,
-                point_labels=labels,
-                multimask_output=False
-            )
-            print('mask size:', masks.shape, type(masks), masks.max())
-            
-            return masks[0]  # Return the first (and only) mask
-            
-        except Exception as e:
-            logging.error(f"Failed to generate mask from clicks: {e}")
-            return None
-    
-    def visualize_clicks_and_mask(self, image, mask=None):
-        """Visualize current clicks and mask on the image."""
-        vis_image = image.copy()
-        
-        # Draw click points
-        for i, (point, label) in enumerate(zip(self.click_points, self.click_labels)):
-            color = (0, 255, 0) if label == 1 else (0, 0, 255)  # Green for positive, red for negative
-            cv2.circle(vis_image, tuple(point), 5, color, -1)
-            cv2.putText(vis_image, f"{i+1}", (point[0]+10, point[1]-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        
-        # Overlay mask if available
-        if mask is not None:
-            # Create colored mask overlay
-            mask_colored = np.zeros_like(vis_image)
-            mask_colored[mask.astype(bool)] = [0, 255, 255]  # Yellow for mask
-            vis_image = cv2.addWeighted(vis_image, 0.7, mask_colored, 0.3, 0)
-        
-        # Add instructions
-        cv2.putText(vis_image, "Left click: positive point", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(vis_image, "Right click: negative point", (10, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(vis_image, "Middle click: clear points", (10, 90), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(vis_image, "Press 'g' to generate mask", (10, 120), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(vis_image, "Press 'y' to confirm, 'n' to retry", (10, 150), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        return vis_image
-    
-    def interactive_mask_selection(self, image):
-        """Main interactive mask selection loop."""
-        self.current_image = image.copy()
-        self.click_points = []
-        self.click_labels = []
-        self.current_mask = None
-        
-        # Setup OpenCV window and mouse callback
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(self.window_name, self.mouse_callback)
-        
-        logging.info("Starting interactive mask selection...")
-        logging.info("Instructions: Left click for positive points, right click for negative points")
-        logging.info("Press 'g' to generate mask, 'y' to confirm, 'n' to retry, 'q' to quit")
-        
-        while True:
-            # Visualize current state
-            vis_image = self.visualize_clicks_and_mask(self.current_image, self.current_mask)
-            cv2.imshow(self.window_name, vis_image)
-            
-            key = cv2.waitKey(1) & 0xFF
-            
-            if key == ord('g'):
-                # Generate mask
-                if len(self.click_points) > 0:
-                    mask = self.generate_mask_from_clicks(self.current_image)
-                    if mask is not None:
-                        self.current_mask = mask
-                        logging.info("Mask generated successfully")
-                    else:
-                        logging.warning("Failed to generate mask")
-                else:
-                    logging.warning("No click points available. Please click on the object first.")
-            
-            elif key == ord('y'):
-                # Confirm and return mask
-                if self.current_mask is not None:
-                    cv2.destroyWindow(self.window_name)
-                    logging.info("Mask confirmed by user")
-                    return self.current_mask.astype(bool)
-                else:
-                    logging.warning("No mask available. Please generate a mask first.")
-            
-            elif key == ord('n'):
-                # Retry - clear everything
-                self.click_points = []
-                self.click_labels = []
-                self.current_mask = None
-                logging.info("Cleared all points and mask. Please try again.")
-            
-            elif key == ord('q'):
-                # Quit
-                cv2.destroyWindow(self.window_name)
-                logging.info("Interactive mask selection cancelled by user")
-                return None
-        
-        cv2.destroyWindow(self.window_name)
-        return None
-
-def pose_initialization_waiting_stage(estimator, metadata, K, color, depth, mask_selector, mode='text'):
+def pose_initialization_waiting_stage(estimator, metadata, K, color, depth, mask_selector):
     """
-    Waiting stage for pose initialization with configurable mask selection mode.
+    Waiting stage for pose initialization with text-based mask prediction.
     
     Args:
         estimator: FoundationPose estimator
@@ -393,114 +233,153 @@ def pose_initialization_waiting_stage(estimator, metadata, K, color, depth, mask
         K: Camera intrinsics matrix
         color: Color image
         depth: Depth image
-        mask_selector: Text2MaskPredictor or InteractiveMaskSelector instance
-        mode: 'text' for text-based prediction, 'interactive' for manual selection
+        mask_selector: Text2MaskPredictor instance
     
     Returns:
         tuple: (success, pose, mask) - success flag, initial pose, and object mask
     """
-    logging.info(f"Starting pose initialization waiting stage in {mode} mode...")
+
+    # Step 2: Generate mask using text prompt
+    logging.info("Starting text-based mask prediction...")
+    object_mask = mask_selector.predict(color)
     
-    # Step 1: Present current image to user
-    if mode == 'text':
-        logging.info("Presenting current image for text-based mask prediction...")
-        temp_img = color.copy()
-        cv2.putText(temp_img, "Generating mask from text prompt...", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow("Current Image - Generating Mask", temp_img)
-        cv2.waitKey(1000)  # Show for 1 second
-        
-        # Step 2: Generate mask using text prompt
-        logging.info("Starting text-based mask prediction...")
-        object_mask = mask_selector.predict(color)
-        
-        if object_mask is None:
-            logging.warning("Text-based mask prediction failed")
-            return False, None, None
-            
-    elif mode == 'interactive':
-        logging.info("Presenting current image for interactive mask selection...")
-        temp_img = color.copy()
-        cv2.putText(temp_img, "Starting interactive mask selection...", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow("Current Image - Click to Select Object", temp_img)
-        cv2.waitKey(1000)  # Show for 1 second
-        
-        # Step 2: Interactive mask selection using SAM2
-        logging.info("Starting interactive mask selection...")
-        object_mask = mask_selector.interactive_mask_selection(color)
-        
-        if object_mask is None:
-            logging.warning("Interactive mask selection cancelled by user")
-            return False, None, None
-    else:
-        logging.error(f"Unknown mode: {mode}. Must be 'text' or 'interactive'")
+    if object_mask is None:
+        logging.warning("Text-based mask prediction failed")
         return False, None, None
     
     # Step 3: Initialize pose with the selected mask
     logging.info("Initializing pose with selected mask...")
-    try:
-        # Convert BGR to RGB for FoundationPose
-        rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
-        
-        # Initialize pose
-        initial_pose = estimator.register(
-            K=K,
-            rgb=rgb,
-            depth=depth,
-            ob_mask=object_mask,
-            iteration=5
-        )
-        
-        if initial_pose is None:
-            logging.error("Pose initialization failed")
-            return False, None, object_mask
-        
-        logging.info("Pose initialization successful")
-        
-        # Step 4: Show pose visualization for user confirmation
-        vis_img = draw_pose_visualization(
-            color, initial_pose, K, metadata['bbox'], metadata['to_origin']
-        )        
-        # save all, current_pose, RGBD, K, bbox, mask
-        fname = osp.join(args.output_dir, 'initial_pose', 'initial_pose.pkl')
-        os.makedirs(osp.dirname(fname), exist_ok=True)
-        with open(fname, 'wb') as f:
-            pickle.dump({'current_pose': initial_pose, 'rgb': rgb, 'depth': depth, 'K': K, 'bbox': metadata['bbox'], 'mask': object_mask}, f)
-        # save vis_img 
-        cv2.imwrite(osp.join(args.output_dir, 'initial_pose', 'initial_pose.jpg'), vis_img)
-        print(f"Saved initial pose to {fname}")
 
-        # Add confirmation text
-        cv2.putText(vis_img, "Initial Pose - Press 'y' to confirm, 'n' to retry", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Show pose center
-        center_3d = initial_pose[:3, 3]
-        cv2.putText(vis_img, f"Position: [{center_3d[0]:.3f}, {center_3d[1]:.3f}, {center_3d[2]:.3f}]", 
-                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        cv2.imshow("Pose Initialization - Confirm or Retry", vis_img)
-        
-        # Wait for user confirmation
-        while True:
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('y'):
-                cv2.destroyWindow("Pose Initialization - Confirm or Retry")
-                logging.info("Pose initialization confirmed by user")
-                return True, initial_pose, object_mask
-            elif key == ord('n'):
-                cv2.destroyWindow("Pose Initialization - Confirm or Retry")
-                logging.info("Pose initialization rejected by user - retrying...")
-                return False, None, object_mask
-            elif key == 27:  # ESC
-                cv2.destroyWindow("Pose Initialization - Confirm or Retry")
-                logging.info("Pose initialization cancelled by user")
-                return False, None, object_mask
-        
-    except Exception as e:
-        logging.error(f"Error during pose initialization: {e}")
+    # Convert BGR to RGB for FoundationPose
+    rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+    
+    # Initialize pose
+    initial_pose = estimator.register(
+        K=K,
+        rgb=rgb,
+        depth=depth,
+        ob_mask=object_mask,
+        iteration=5
+    )
+    
+    if initial_pose is None:
+        logging.error("Pose initialization failed")
         return False, None, object_mask
+    
+    logging.info("Pose initialization successful")
+    return True, initial_pose, object_mask
+        
+
+def evaluate_tracking_score(pose, K, color, mask_selector, estimator=None):
+    """
+    Evaluate tracking score using reprojection error between projected mask and detected mask.
+    
+    Args:
+        pose: 4x4 pose matrix
+        K: Camera intrinsics matrix
+        color: Color image
+        mask_selector: Text2MaskPredictor instance
+        estimator: FoundationPose estimator (optional, for mesh rendering)
+    
+    Returns:
+        float: Tracking score (0.0 to 1.0, higher is better)
+    """
+    # Get current mask from mask selector
+    print(type(color), mask_selector.device)
+    current_mask = mask_selector.predict(color)
+    if current_mask is None:
+        return 0.0
+    
+    H, W = color.shape[:2]
+    
+    # Method 1: Use mesh rendering if estimator is available
+    if estimator is not None and hasattr(estimator, 'mesh') and estimator.mesh is not None:
+        # try:
+        # Convert pose to centered mesh coordinates for rendering
+        pose_centered = pose @ np.linalg.inv(estimator.get_tf_to_centered_mesh().cpu().numpy())
+        
+        # Render the mesh using nvdiffrast
+        
+        
+        # Create projection matrix
+        projection_mat = np.array([
+            [2*K[0,0]/W, 0, 0, 0],
+            [0, 2*K[1,1]/H, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+        
+        # Render mesh to get depth and mask
+        # rendered_depth, rendered_mask 
+        rendered_rgb, rendered_depth, rendered_normal_map = nvdiffrast_render(
+            K=K, H=H, W=W, 
+            ob_in_cams=torch.tensor(pose_centered.reshape(1, 4, 4), device='cuda'),
+            glctx=estimator.glctx,
+            mesh=estimator.mesh,
+            mesh_tensors=estimator.mesh_tensors,
+            projection_mat=projection_mat,
+            output_size=(H, W)
+        )
+        # print('rendred depth edge:', rendered_depth.min(), rendered_depth.max(), rendered_depth.shape)
+        projected_mask = (rendered_depth[0] > 0)
+        projected_mask = projected_mask.detach().cpu().numpy()
+        # print('projected', projected_mask.shape, projected_mask.min(), projected_mask.max(), projected_mask.float().mean())
+        # print('rgb', rendered_rgb.max(), rendered_rgb.min())
+        # save rendered_rgb, rendered_depth, rendered_normal_map to outputs/tmp/rendered_rgb.png, outputs/tmp/rendered_depth.png, outputs/tmp/rendered_normal_map.png
+
+        # os.makedirs('outputs/tmp', exist_ok=True)
+        # import pdb; pdb.set_trace()
+        # imageio.imwrite('outputs/tmp/rendered_rgb.png', rendered_rgb[0].cpu().numpy())
+        # imageio.imwrite('outputs/tmp/rendered_depth.png', rendered_depth[0].cpu().numpy())
+        # imageio.imwrite('outputs/tmp/rendered_normal_map.png', rendered_normal_map[0].cpu().numpy())
+        # imageio.imwrite('outputs/tmp/projected_mask.png', projected_mask.cpu().numpy())
+        # assert False
+            
+        # except Exception as e:
+        #     logging.warning(f"Mesh rendering failed: {e}, using fallback method")
+        #     # Fallback to simplified method
+        #     projected_mask = create_simple_projected_mask(pose, K, H, W)
+    else:
+        # Method 2: Simplified projection using pose center and estimated size
+        projected_mask = create_simple_projected_mask(pose, K, H, W)
+    
+    # Calculate IoU (Intersection over Union) between masks
+    intersection = np.logical_and(projected_mask, current_mask).sum()
+    union = np.logical_or(projected_mask, current_mask).sum()
+    
+    if union == 0:
+        return 0.0
+    
+    iou = intersection / union
+    
+    # Convert IoU to a score (0.0 to 1.0)
+    # IoU of 0.5+ is considered good tracking
+    score = min(1.0, iou * 2.0)  # Scale IoU to get better score range
+    
+    return float(score)
+
+
+def create_simple_projected_mask(pose, K, H, W):
+    """Create a simple projected mask using pose center and estimated size."""
+    projected_mask = np.zeros((H, W), dtype=bool)
+    
+    # Project the pose center to 2D
+    center_3d = pose[:3, 3]
+    center_2d = K @ center_3d
+    center_2d = center_2d[:2] / center_2d[2]
+    
+    # Create a simple circular mask around the projected center
+    if 0 <= center_2d[0] < W and 0 <= center_2d[1] < H:
+        # Estimate object size based on pose scale (simplified)
+        scale = np.linalg.norm(pose[:3, :3], axis=0).mean()
+        radius = max(20, int(50 * scale))  # Adaptive radius
+        
+        # Create circular mask
+        y, x = np.ogrid[:H, :W]
+        mask_circle = (x - center_2d[0])**2 + (y - center_2d[1])**2 <= radius**2
+        projected_mask = mask_circle
+    
+    return projected_mask
 
 def draw_pose_visualization(color, pose, K, bbox, to_origin, scale=0.1):
     """
@@ -535,8 +414,8 @@ def draw_pose_visualization(color, pose, K, bbox, to_origin, scale=0.1):
 def stream_pose_estimation(mesh_file, output_dir='./realsense_output', 
                           est_refine_iter=5, track_refine_iter=2, 
                           save_poses=True, save_visualizations=True, 
-                          show_preview=True, device='cuda:0', text_prompt='yellow bottle', 
-                          mode='text'):
+                          show_preview=True, device='cuda:0', text_prompt='yellow bottle',
+                          tracking_threshold=0.5):
     """
     Main function to stream RGBD from RealSense and estimate object poses.
     
@@ -549,8 +428,8 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
         save_visualizations (bool): Whether to save visualization images
         show_preview (bool): Whether to show real-time preview
         device (str): Device for SAM2 (cuda:0, cpu, etc.)
-        text_prompt (str): Text prompt for object detection (text mode only)
-        mode (str): Mask selection mode - 'text' for automatic, 'interactive' for manual
+        text_prompt (str): Text prompt for object detection and segmentation
+        tracking_threshold (float): Tracking score threshold for reinitialization (0.0-1.0)
     """
     
     # Setup logging
@@ -559,23 +438,10 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
     # Initialize FoundationPose
     estimator, metadata = setup_foundation_pose(mesh_file, debug=2, debug_dir=output_dir)
     
-    # Initialize mask selector based on mode
-    if mode == 'text':
-        mask_selector = Text2MaskPredictor(device=device, text_prompt=text_prompt)
-        if not mask_selector.initialized:
-            logging.error("Failed to initialize Text2MaskPredictor. Cannot proceed without mask prediction.")
-            return
-    elif mode == 'interactive':
-        mask_selector = InteractiveMaskSelector(device=device)
-        if not mask_selector.setup_sam2():
-            logging.error("Failed to initialize SAM2 for interactive mode. Falling back to text mode.")
-            mode = 'text'
-            mask_selector = Text2MaskPredictor(device=device, text_prompt=text_prompt)
-            if not mask_selector.initialized:
-                logging.error("Failed to initialize Text2MaskPredictor. Cannot proceed.")
-                return
-    else:
-        logging.error(f"Unknown mode: {mode}. Must be 'text' or 'interactive'")
+    # Initialize text-to-mask predictor
+    mask_selector = Text2MaskPredictor(device=device, text_prompt=text_prompt)
+    if not mask_selector.initialized:
+        logging.error("Failed to initialize Text2MaskPredictor. Cannot proceed without mask prediction.")
         return
     
     # Setup RealSense
@@ -600,6 +466,8 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
     frame_count = 0
     pose_initialized = False
     current_pose = None
+    tracking_loop_active = False
+    tracking_score_threshold = tracking_threshold  # Threshold for tracking quality
     
     try:
         while True:
@@ -617,10 +485,10 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
             # Convert BGR to RGB for FoundationPose
             rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
             
-            if not pose_initialized:
-                # Show waiting message and wait for user to press key to start initialization
+            if not tracking_loop_active:
+                # Show waiting message and wait for user to press key to start tracking loop
                 vis_img = color.copy()
-                cv2.putText(vis_img, "Press 'i' to initialize pose", 
+                cv2.putText(vis_img, "Press 'i' to start tracking loop", 
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 cv2.putText(vis_img, "Press ESC to quit", 
                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -632,28 +500,10 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
                     key = cv2.waitKey(1) & 0xFF
                     
                     if key == ord('i'):
-                        # User pressed 'i' - start pose initialization waiting stage
-                        logging.info(f"User triggered pose initialization (frame {frame_count})")
-                        
-                        if mask_selector is not None:
-                            # Use mask selection based on mode
-                            print('depth minmax', depth.min(), depth.max())
-                            
-                            success, initial_pose, selected_mask = pose_initialization_waiting_stage(
-                                estimator, metadata, K, color, depth.astype(np.float32) * depth_scale, mask_selector, mode
-                            )
-                            
-                            if success and initial_pose is not None:
-                                current_pose = initial_pose
-                                pose_initialized = True
-                                logging.info("Pose initialization completed successfully")
-                            else:
-                                logging.warning("Pose initialization failed or cancelled")
-                                # Continue to next frame to retry
-                                continue
-                        else:
-                            raise ValueError("Mask selector is not initialized")
-                            
+                        # User pressed 'i' - start tracking loop
+                        logging.info(f"User started tracking loop (frame {frame_count})")
+                        tracking_loop_active = True
+                        pose_initialized = False  # Start with pose initialization
                     elif key == 27:  # ESC to quit
                         break
                 else:
@@ -661,19 +511,57 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
                     import time
                     time.sleep(0.1)
             else:
-                # Pose tracking
-                try:
+                tracking_score = -1
+                # Tracking loop is active
+                if not pose_initialized:
+                    # Step 2: Initialize pose if not initialized
+                    logging.info(f"Initializing pose (frame {frame_count})")
+                    
+                    if mask_selector is not None:
+                        # Use text-based mask prediction
+                        print('depth minmax', depth.min(), depth.max())
+                        
+                        success, initial_pose, selected_mask = pose_initialization_waiting_stage(
+                            estimator, metadata, K, color, depth.astype(np.float32) * depth_scale, mask_selector
+                        )
+                        
+                        if success and initial_pose is not None:
+                            current_pose = initial_pose
+                            pose_initialized = True
+                            logging.info("Pose initialization completed successfully")
+                        else:
+                            logging.warning("Pose initialization failed, will retry next frame")
+                            # Continue to next frame to retry
+                            continue
+                else:
+                    # Step 3: Pose tracking
+                    # try:
                     current_pose = estimator.track_one(
                         rgb=rgb, 
                         depth=depth, 
                         K=K, 
                         iteration=track_refine_iter
                     )
-                except Exception as e:
-                    logging.warning(f"Pose tracking failed: {e}")
-                    # Reset to initialization mode
-                    pose_initialized = False
-                    current_pose = None
+                    tracking_score = evaluate_tracking_score(current_pose, K, color, mask_selector, estimator)
+                    
+                    # Step 4: Check tracking quality and reinitialize if needed
+                    if current_pose is not None:
+                        
+                        if tracking_score < tracking_score_threshold:
+                            logging.warning(f"Tracking score {tracking_score:.3f} below threshold {tracking_score_threshold}, reinitializing...")
+                            pose_initialized = False
+                        else:
+                            logging.info(f"Tracking successful, score: {tracking_score:.3f}")
+                    else:
+                        logging.warning("Tracking failed, reinitializing...")
+                        pose_initialized = False
+                        current_pose = None
+                        
+                    # except Exception as e:
+                    #     logging.warning(f"Pose tracking failed: {e}, reinitializing...")
+                    #     # Reset to initialization mode
+                    #     pose_initialized = False
+                    #     current_pose = None
             
             # Save pose if available
             if current_pose is not None and save_poses:
@@ -682,21 +570,35 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
             
             # Create visualization
             vis_img = color.copy()
-            if current_pose is not None:
-                vis_img = draw_pose_visualization(
-                    vis_img, current_pose, K, metadata['bbox'], metadata['to_origin']
-                )
-                
-                # Add pose info text
-                center_3d = current_pose[:3, 3]
-                cv2.putText(vis_img, f"Pos: [{center_3d[0]:.3f}, {center_3d[1]:.3f}, {center_3d[2]:.3f}]", 
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(vis_img, f"Frame: {frame_count}", 
-                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(vis_img, "Tracking Active", 
-                           (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            if tracking_loop_active:
+                if current_pose is not None:
+                    vis_img = draw_pose_visualization(
+                        vis_img, current_pose, K, metadata['bbox'], metadata['to_origin']
+                    )
+                    
+                    # Add pose info text
+                    center_3d = current_pose[:3, 3]
+                    cv2.putText(vis_img, f"Pos: [{center_3d[0]:.3f}, {center_3d[1]:.3f}, {center_3d[2]:.3f}]", 
+                               (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(vis_img, f"Frame: {frame_count}", 
+                               (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    if pose_initialized:
+                        cv2.putText(vis_img, f"Tracking Active, score: {tracking_score:.3f}", 
+                                   (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    else:
+                        cv2.putText(vis_img, "Initializing Pose...", 
+                                   (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                else:
+                    if pose_initialized:
+                        cv2.putText(vis_img, "Tracking Failed - Reinitializing...", 
+                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    else:
+                        cv2.putText(vis_img, "Initializing Pose...", 
+                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(vis_img, f"Frame: {frame_count}", 
+                               (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             else:
-                cv2.putText(vis_img, "Press 'i' to initialize pose", 
+                cv2.putText(vis_img, "Press 'i' to start tracking loop", 
                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 cv2.putText(vis_img, "Press ESC to quit", 
                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -747,8 +649,8 @@ if __name__ == "__main__":
                        help='Device for SAM2 (cuda:0, cpu, etc.)')
     parser.add_argument('--text_prompt', type=str, default='yellow bottle',
                        help='Text prompt for object detection and segmentation')
-    parser.add_argument('--mode', type=str, default='text', choices=['text', 'interactive'],
-                       help='Mask selection mode: text (automatic) or interactive (manual)')
+    parser.add_argument('--tracking_threshold', type=float, default=0.5,
+                       help='Tracking score threshold for reinitialization (0.0-1.0)')
     
     args = parser.parse_args()
     
@@ -762,5 +664,5 @@ if __name__ == "__main__":
         show_preview=not args.no_preview,
         device=args.device,
         text_prompt=args.text_prompt,
-        mode=args.mode
+        tracking_threshold=args.tracking_threshold
     )
