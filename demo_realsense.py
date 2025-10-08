@@ -385,7 +385,7 @@ def draw_pose_visualization(color, pose, K, bbox, to_origin, scale=0.1):
 
 def stream_pose_estimation(mesh_file, output_dir='./realsense_output', 
                           est_refine_iter=5, track_refine_iter=2, 
-                          save_poses=True, save_visualizations=True, 
+                          save_poses=True, save_visualizations=False, 
                           show_preview=True, device='cuda:0', text_prompt='yellow bottle',
                           tracking_threshold=0.5):
     """
@@ -508,12 +508,12 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
                             # Continue to next frame to retry
                             continue
                 else:
-                    # Step 3: Pose tracking
-                    # try:
+                    print(rgb.shape)
+                    new_rgb, new_depth, new_K = resize(rgb, depth, K, MAX_SIZE)
                     current_pose = estimator.track_one(
-                        rgb=rgb, 
-                        depth=depth, 
-                        K=K, 
+                        rgb=new_rgb, 
+                        depth=new_depth.astype(np.float32) * depth_scale, 
+                        K=new_K, 
                         iteration=track_refine_iter
                     )
                     os.makedirs(osp.join(output_dir, f'mask'), exist_ok=True)
@@ -601,6 +601,23 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
         logging.info(f"Streaming completed. Processed {frame_count} frames.")
         logging.info(f"Outputs saved to: {output_dir}")
 
+
+MAX_SIZE = 320
+def resize(rgb, depth, K, max_length=640):
+    K = K.copy()
+    H, W = rgb.shape[:2]
+    if H > max_length or W > max_length:
+        scale = max_length / max(H, W)
+        new_H = int(H * scale)
+        new_W = int(W * scale)
+        rgb = cv2.resize(rgb, (new_W, new_H))
+        depth = cv2.resize(depth, (new_W, new_H))
+        K[0,0] = K[0,0] * scale
+        K[1,1] = K[1,1] * scale
+        K[0,2] = K[0,2] * scale
+        K[1,2] = K[1,2] * scale
+    return rgb, depth, K
+
 if __name__ == "__main__":
     # Example usage
     import argparse
@@ -617,8 +634,8 @@ if __name__ == "__main__":
                        help='Iterations for pose tracking')
     parser.add_argument('--no_save_poses', action='store_true',
                        help='Disable saving pose files')
-    parser.add_argument('--no_save_vis', action='store_true',
-                       help='Disable saving visualization images')
+    parser.add_argument('--save_vis', action='store_true',
+                       help=' saving visualization images')
     parser.add_argument('--no_preview', action='store_true',
                        help='Disable real-time preview')
     parser.add_argument('--device', type=str, default='cuda:0',
@@ -636,7 +653,7 @@ if __name__ == "__main__":
         est_refine_iter=args.est_refine_iter,
         track_refine_iter=args.track_refine_iter,
         save_poses=not args.no_save_poses,
-        save_visualizations=not args.no_save_vis,
+        save_visualizations=args.save_vis,
         show_preview=not args.no_preview,
         device=args.device,
         text_prompt=args.text_prompt,
