@@ -270,7 +270,7 @@ def pose_initialization_waiting_stage(estimator, metadata, K, color, depth, mask
     return True, initial_pose, object_mask
         
 
-def evaluate_tracking_score(pose, K, color, mask_selector, estimator=None):
+def evaluate_tracking_score(pose, K, color, mask_selector, estimator=None, save_pref='realsense_output/'):
     """
     Evaluate tracking score using reprojection error between projected mask and detected mask.
     
@@ -288,61 +288,33 @@ def evaluate_tracking_score(pose, K, color, mask_selector, estimator=None):
     print(type(color), mask_selector.device)
     current_mask = mask_selector.predict(color)
     if current_mask is None:
+        print('current_mask is None')
         return 0.0
     
     H, W = color.shape[:2]
-    
-    # Method 1: Use mesh rendering if estimator is available
-    if estimator is not None and hasattr(estimator, 'mesh') and estimator.mesh is not None:
-        # try:
-        # Convert pose to centered mesh coordinates for rendering
-        pose_centered = pose @ np.linalg.inv(estimator.get_tf_to_centered_mesh().cpu().numpy())
-        
-        # Render the mesh using nvdiffrast
-        
-        
-        # Create projection matrix
-        projection_mat = np.array([
-            [2*K[0,0]/W, 0, 0, 0],
-            [0, 2*K[1,1]/H, 0, 0],
-            [0, 0, -1, 0],
-            [0, 0, 0, 1]
-        ], dtype=np.float32)
-        
-        # Render mesh to get depth and mask
-        # rendered_depth, rendered_mask 
-        rendered_rgb, rendered_depth, rendered_normal_map = nvdiffrast_render(
-            K=K, H=H, W=W, 
-            ob_in_cams=torch.tensor(pose_centered.reshape(1, 4, 4), device='cuda'),
-            glctx=estimator.glctx,
-            mesh=estimator.mesh,
-            mesh_tensors=estimator.mesh_tensors,
-            projection_mat=projection_mat,
-            output_size=(H, W)
-        )
-        # print('rendred depth edge:', rendered_depth.min(), rendered_depth.max(), rendered_depth.shape)
-        projected_mask = (rendered_depth[0] > 0)
-        projected_mask = projected_mask.detach().cpu().numpy()
-        # print('projected', projected_mask.shape, projected_mask.min(), projected_mask.max(), projected_mask.float().mean())
-        # print('rgb', rendered_rgb.max(), rendered_rgb.min())
-        # save rendered_rgb, rendered_depth, rendered_normal_map to outputs/tmp/rendered_rgb.png, outputs/tmp/rendered_depth.png, outputs/tmp/rendered_normal_map.png
 
-        # os.makedirs('outputs/tmp', exist_ok=True)
-        # import pdb; pdb.set_trace()
-        # imageio.imwrite('outputs/tmp/rendered_rgb.png', rendered_rgb[0].cpu().numpy())
-        # imageio.imwrite('outputs/tmp/rendered_depth.png', rendered_depth[0].cpu().numpy())
-        # imageio.imwrite('outputs/tmp/rendered_normal_map.png', rendered_normal_map[0].cpu().numpy())
-        # imageio.imwrite('outputs/tmp/projected_mask.png', projected_mask.cpu().numpy())
-        # assert False
-            
-        # except Exception as e:
-        #     logging.warning(f"Mesh rendering failed: {e}, using fallback method")
-        #     # Fallback to simplified method
-        #     projected_mask = create_simple_projected_mask(pose, K, H, W)
-    else:
-        # Method 2: Simplified projection using pose center and estimated size
-        projected_mask = create_simple_projected_mask(pose, K, H, W)
+    # Convert pose to centered mesh coordinates for rendering
+    # pose_centered = pose @ np.linalg.inv(estimator.get_tf_to_centered_mesh().cpu().numpy())
+    pose_centered = pose.astype(np.float32)
+    # Render the mesh using nvdiffrast
     
+    # Render mesh to get depth and mask
+    # rendered_depth, rendered_mask 
+    rendered_rgb, rendered_depth, rendered_normal_map = nvdiffrast_render(
+        K=K, H=H, W=W, 
+        ob_in_cams=torch.tensor(pose_centered.reshape(1, 4, 4), device='cuda'),
+        glctx=estimator.glctx,
+        mesh=estimator.mesh,
+        mesh_tensors=estimator.mesh_tensors,
+        # projection_mat=projection_mat,
+        output_size=(H, W)
+    )
+    projected_mask = (rendered_depth[0] > 0)
+    projected_mask = projected_mask.detach().cpu().numpy()
+    
+    # canvas = np.concatenate([current_mask, projected_mask], axis=1).astype(np.uint8) * 255
+    # cv2.imwrite(save_pref + 'mask_projected.png', canvas)
+
     # Calculate IoU (Intersection over Union) between masks
     intersection = np.logical_and(projected_mask, current_mask).sum()
     union = np.logical_or(projected_mask, current_mask).sum()
@@ -436,7 +408,7 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
     logging.basicConfig(level=logging.INFO)
     
     # Initialize FoundationPose
-    estimator, metadata = setup_foundation_pose(mesh_file, debug=2, debug_dir=output_dir)
+    estimator, metadata = setup_foundation_pose(mesh_file, debug=0, debug_dir=output_dir)
     
     # Initialize text-to-mask predictor
     mask_selector = Text2MaskPredictor(device=device, text_prompt=text_prompt)
@@ -519,12 +491,14 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
                     
                     if mask_selector is not None:
                         # Use text-based mask prediction
-                        print('depth minmax', depth.min(), depth.max())
                         
                         success, initial_pose, selected_mask = pose_initialization_waiting_stage(
                             estimator, metadata, K, color, depth.astype(np.float32) * depth_scale, mask_selector
                         )
-                        
+
+                        tracking_score = evaluate_tracking_score(initial_pose, K, color, mask_selector, estimator, 
+                                                                save_pref=osp.join(output_dir, f'mask/initial_{frame_count:06d}'))
+
                         if success and initial_pose is not None:
                             current_pose = initial_pose
                             pose_initialized = True
@@ -542,7 +516,9 @@ def stream_pose_estimation(mesh_file, output_dir='./realsense_output',
                         K=K, 
                         iteration=track_refine_iter
                     )
-                    tracking_score = evaluate_tracking_score(current_pose, K, color, mask_selector, estimator)
+                    os.makedirs(osp.join(output_dir, f'mask'), exist_ok=True)
+                    tracking_score = evaluate_tracking_score(current_pose, K, color, mask_selector, estimator, 
+                                                            save_pref=osp.join(output_dir, f'mask/{frame_count:06d}'))
                     
                     # Step 4: Check tracking quality and reinitialize if needed
                     if current_pose is not None:
